@@ -93,6 +93,8 @@ TOKEN, TOKEN_SOURCE = load_discord_token()
 # function is defined, not when it is called.
 GUEST_SYSTEMD_ENABLED = env_bool("GUEST_SYSTEMD_ENABLED", True)
 GUEST_NESTED_DOCKER = env_bool("GUEST_NESTED_DOCKER", True)
+GUEST_REQUIRE_NESTED_DOCKER = env_bool("GUEST_REQUIRE_NESTED_DOCKER", False)
+GUEST_PERSIST_SYSTEM_DIRS = env_bool("GUEST_PERSIST_SYSTEM_DIRS", False)
 GUEST_SYSTEMD_PRIVILEGED = env_bool("GUEST_SYSTEMD_PRIVILEGED", True)
 GUEST_CGROUPNS_HOST = env_bool("GUEST_CGROUPNS_HOST", True)
 GUEST_INSTALL_WINGS = env_bool("GUEST_INSTALL_WINGS", True)
@@ -145,6 +147,8 @@ DISABLE_CONTAINER_SWAP = env_bool("DISABLE_CONTAINER_SWAP", True)
 # Never start/reconfigure a host Docker daemon implicitly. This is especially
 # important when RGNODES itself runs under Pterodactyl/Wings or another supervisor.
 MANAGE_DOCKER_DAEMON = env_bool("MANAGE_DOCKER_DAEMON", False)
+AUTO_INSTALL_DOCKER = env_bool("AUTO_INSTALL_DOCKER", True)
+AUTO_REPAIR_DOCKER = env_bool("AUTO_REPAIR_DOCKER", True)
 DISCORD_API_TIMEOUT = env_int("DISCORD_API_TIMEOUT", 10, 3, 30)
 PROGRESS_UPDATE_TIMEOUT = env_int("PROGRESS_UPDATE_TIMEOUT", 5, 2, 20)
 SSHX_TOTAL_TIMEOUT = env_int("SSHX_TOTAL_TIMEOUT", 100, 30, 240)
@@ -979,6 +983,8 @@ RUNTIME_CONFIG_SPEC: dict[str, tuple[str, object, int | float | None, int | floa
     "min_cpu": ("float", "0.1", 0.1, 64),
     "max_cpu": ("float", "64", 0.1, 64),
     "guest_systemd_enabled": ("bool", GUEST_SYSTEMD_ENABLED, None, None),
+    "guest_require_nested_docker": ("bool", GUEST_REQUIRE_NESTED_DOCKER, None, None),
+    "guest_persist_system_dirs": ("bool", GUEST_PERSIST_SYSTEM_DIRS, None, None),
     "guest_nested_docker": ("bool", GUEST_NESTED_DOCKER, None, None),
     "guest_install_wings": ("bool", GUEST_INSTALL_WINGS, None, None),
     "guest_install_kvm_libvirt": ("bool", GUEST_INSTALL_KVM_LIBVIRT, None, None),
@@ -1775,10 +1781,31 @@ async def run_process(*args: str, timeout: float = 60, stdin: bytes | None = Non
         raise
 
 
+def docker_binary() -> str | None:
+    """Resolve Docker without depending on the caller/supervisor PATH.
+
+    systemd, cron, PM2, Pterodactyl and custom supervisors may provide a
+    reduced PATH. Prefer an absolute Docker binary path and fall back to PATH.
+    """
+    candidates = [
+        os.getenv("DOCKER_BIN", "").strip(),
+        "/usr/bin/docker",
+        "/usr/local/bin/docker",
+        "/snap/bin/docker",
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return shutil.which("docker")
+
+
 async def docker_cli(*args: str, timeout: float = DOCKER_TIMEOUT, retries: int = 0) -> tuple[int, bytes, bytes]:
     last: tuple[int, bytes, bytes] = (126, b"", b"docker command failed")
+    binary = docker_binary()
+    if not binary:
+        return 127, b"", b"Docker CLI is not installed or is not available in PATH."
     for attempt in range(max(0, retries) + 1):
-        last = await run_process("docker", *args, timeout=timeout)
+        last = await run_process(binary, *args, timeout=timeout)
         if last[0] == 0:
             return last
         text = last[2].decode("utf-8", "replace").lower()
@@ -1828,7 +1855,7 @@ async def _wait_for_docker_ready(timeout: float = 30.0) -> tuple[bool, str]:
 
 async def _start_docker_daemon() -> tuple[bool, str]:
     """Start an existing Docker daemon without assuming systemd is PID 1."""
-    if not command_available("docker"):
+    if not docker_binary():
         return False, "Docker CLI is not installed."
 
     ok, detail = await _probe_docker_info()
@@ -1960,26 +1987,62 @@ async def docker_host_preflight() -> tuple[bool, str]:
     return True, "Docker preflight passed."
 
 async def docker_info() -> tuple[bool, str]:
-    """Return Docker readiness without silently changing host service state."""
-    if not command_available("docker"):
+    """Return Docker readiness and safely self-heal a missing daemon/CLI.
+
+    Deployment should not fail merely because Docker was never bootstrapped on
+    a supported Debian/Ubuntu host. We first probe, optionally install/repair
+    Docker as root, then probe again. We never fabricate readiness.
+    """
+    if docker_binary():
+        ok, detail = await _probe_docker_info()
+        if ok:
+            return True, detail
+    elif not AUTO_INSTALL_DOCKER:
         return False, (
-            "Docker CLI is not installed. Run `/install-system confirm:true` "
-            "as an administrator on a host where Docker is supported."
+            "Docker CLI is not installed. Enable AUTO_INSTALL_DOCKER=true or run "
+            "`/install-system confirm:true` as an administrator on a supported host."
+        )
+
+    # Automatic bootstrap is deliberately restricted to root + apt hosts.
+    if AUTO_INSTALL_DOCKER and hasattr(os, "geteuid") and os.geteuid() == 0 and shutil.which("apt-get"):
+        try:
+            installed, detail = await asyncio.wait_for(install_system_dependencies(), timeout=720)
+        except asyncio.TimeoutError:
+            installed, detail = False, "Automatic Docker bootstrap timed out."
+        except Exception as exc:
+            installed, detail = False, f"Automatic Docker bootstrap failed: {safe_log(exc)}"
+        if installed and docker_binary():
+            ok, probe_detail = await _probe_docker_info()
+            if ok:
+                return True, "Docker was automatically installed/repaired and is ready." + "\n" + safe_log(probe_detail, 1200)
+        # Keep the real installer diagnostic instead of replacing it with a
+        # generic missing-CLI message.
+        if detail:
+            logger.warning("Automatic Docker bootstrap did not produce a ready daemon: %s", safe_log(detail))
+
+    if AUTO_REPAIR_DOCKER and MANAGE_DOCKER_DAEMON and docker_binary():
+        started, start_detail = await _start_docker_daemon()
+        if started:
+            return True, start_detail
+        return False, start_detail
+
+    if not docker_binary():
+        return False, (
+            "Docker CLI is not installed and automatic installation is unavailable on this host. "
+            "Use a supported Debian/Ubuntu host, install Docker, or enable `/install-system confirm:true`."
         )
 
     ok, detail = await _probe_docker_info()
     if ok:
         return True, detail
-
     if MANAGE_DOCKER_DAEMON:
         started, start_detail = await _start_docker_daemon()
         if started:
             return True, start_detail
         return False, start_detail or detail
-
     return False, (
         "Docker CLI is installed, but the Docker daemon is not reachable. "
-        "RGNODES will not start/reconfigure the host daemon automatically. "
+        "The host must provide a running Docker daemon/socket. "
         + safe_log(detail)
     )
 
@@ -2059,8 +2122,12 @@ BOOTSTRAP_MARKER=/etc/rgnodes/.bootstrap-installed
 # Persistent VPS data lives in named Docker volumes. docker rm (without -v)
 # does not delete these volumes, allowing reinstall/recreate to reattach them.
 PERSISTENCE_POLICY=/var/lib/rgnodes/persistence-policy
-mkdir -p /var/lib/rgnodes /etc/rgnodes /etc/ssh /etc/systemd/system
+mkdir -p /var/lib/rgnodes /etc/rgnodes /etc/ssh /etc/systemd/system /var/log/rgnodes
 printf 'named-volumes=enabled\ncontainer-delete=preserve-volumes\n' >"$PERSISTENCE_POLICY"
+BOOTSTRAP_LOG=/var/log/rgnodes/bootstrap.log
+BOOTSTRAP_FAILURE=/etc/rgnodes/bootstrap.failed
+exec > >(tee -a "$BOOTSTRAP_LOG") 2>&1
+trap 'rc=$?; printf "exit=%s line=%s cmd=%s\n" "$rc" "$LINENO" "${BASH_COMMAND:-unknown}" >"$BOOTSTRAP_FAILURE"; printf "[RGNODES guest] bootstrap failed: rc=%s line=%s cmd=%s\n" "$rc" "$LINENO" "${BASH_COMMAND:-unknown}" >&2' ERR
 
 log() { printf '[RGNODES guest] %s\\n' "$*"; }
 
@@ -2507,9 +2574,11 @@ wait_active() {
     return 1
 }
 
-systemctl enable docker.service >/dev/null 2>&1 || true
+if [ "__REQUIRE_NESTED_DOCKER__" = "1" ]; then
+    systemctl enable docker.service >/dev/null 2>&1 || true
+    wait_active docker.service 60
+fi
 systemctl enable ssh.service >/dev/null 2>&1 || systemctl enable sshd.service >/dev/null 2>&1 || true
-wait_active docker.service 60
 if systemctl cat ssh.service >/dev/null 2>&1; then
     wait_active ssh.service 30
 elif systemctl cat sshd.service >/dev/null 2>&1; then
@@ -2528,42 +2597,23 @@ for unit in nginx.service redis-server.service mariadb.service; do
 done
 
 command -v systemctl >/dev/null
-command -v docker >/dev/null
-docker info >/dev/null 2>&1
-docker compose version >/dev/null 2>&1
-command -v node >/dev/null
-command -v npm >/dev/null
-command -v yarn >/dev/null
-command -v pm2 >/dev/null
-pm2 -v >/dev/null
 sshd -t
-command -v composer >/dev/null
-composer --version --no-ansi | grep -Eq 'Composer version 2\.'
-# Keep common web/Pterodactyl ports permitted for guests without enabling UFW
-# on hosts where an administrator deliberately manages firewall state elsewhere.
-if command -v ufw >/dev/null 2>&1; then
-    ufw allow 22/tcp >/dev/null 2>&1 || true
-    ufw allow 80/tcp >/dev/null 2>&1 || true
-    ufw allow 443/tcp >/dev/null 2>&1 || true
-    ufw allow 8080/tcp >/dev/null 2>&1 || true
-    ufw allow 8443/tcp >/dev/null 2>&1 || true
-    if ufw status 2>/dev/null | grep -qi '^Status: active'; then ufw reload >/dev/null 2>&1 || true; fi
-fi
-command -v php >/dev/null
-php -r 'exit(version_compare(PHP_VERSION, "8.2", ">=") ? 0 : 1);'
-for ext in curl dom fileinfo gd mbstring openssl pdo pdo_mysql tokenizer xml zip bcmath; do
-    php -m | grep -iq "^$ext$" || { echo "missing PHP extension: $ext" >&2; exit 26; }
-done
-if systemctl list-unit-files 'php*-fpm.service' 2>/dev/null | grep -q 'php.*-fpm.service'; then
-    php_unit="$(systemctl list-unit-files 'php*-fpm.service' --no-legend 2>/dev/null | awk 'NR==1{print $1}')"
-    [ -n "$php_unit" ] && wait_active "$php_unit" 45 || true
-fi
-
-if command -v wings >/dev/null 2>&1; then
-    wings --version >/dev/null 2>&1 || true
-fi
-
-
+# Nested Docker, PHP, Node.js, Composer, database and web components are
+# optional guest features. Their availability is recorded separately and does
+# not invalidate a healthy systemd/SSH VPS.
+{
+    if command -v docker >/dev/null 2>&1; then
+        docker info >/dev/null 2>&1 && echo 'optional: guest docker ready' || echo 'optional: guest docker installed but daemon unavailable'
+    else
+        echo 'optional: guest docker unavailable'
+    fi
+    command -v node >/dev/null 2>&1 && node -v || echo 'optional: node unavailable'
+    command -v npm >/dev/null 2>&1 && npm -v || echo 'optional: npm unavailable'
+    command -v yarn >/dev/null 2>&1 && yarn --version || echo 'optional: yarn unavailable'
+    command -v pm2 >/dev/null 2>&1 && pm2 -v || echo 'optional: pm2 unavailable'
+    command -v composer >/dev/null 2>&1 && composer --version --no-ansi | head -n1 || echo 'optional: composer unavailable'
+    command -v php >/dev/null 2>&1 && php -v | head -n1 || echo 'optional: php unavailable'
+} >/var/log/rgnodes/optional-tools.log 2>&1 || true
 printf 'ready=1\n' >"$READY"
 EOF
     chmod 0755 /usr/local/sbin/rgnodes-firstboot-verify
@@ -2595,13 +2645,21 @@ if command -v apt-get >/dev/null 2>&1; then
         trap remove_policy EXIT
         log 'Installing base Linux/systemd/SSH dependencies'
         apt_install_base
-        install_docker_debian_ubuntu
-        install_kvm_libvirt_stack
-        install_node_pm2_yarn
-        install_web_and_database_stack
-        install_composer
+        if [ "__NESTED_DOCKER__" = "1" ]; then
+            if ! install_docker_debian_ubuntu; then
+                if [ "__REQUIRE_NESTED_DOCKER__" = "1" ]; then
+                    log 'Nested Docker is required but could not be installed.'
+                    exit 42
+                fi
+                log 'Guest Docker setup failed; nested Docker remains unavailable.'
+            fi
+        fi
+        install_kvm_libvirt_stack || log 'KVM/libvirt setup failed; continuing.'
+        install_node_pm2_yarn || log 'Node.js/PM2/Yarn setup failed; continuing.'
+        install_web_and_database_stack || log 'Web/database stack setup failed; continuing.'
+        install_composer || log 'Composer setup failed; continuing.'
         repair_ssh
-        install_wings
+        install_wings || log 'Wings setup failed; continuing.'
         install_firstboot_unit
         touch "$BOOTSTRAP_MARKER"
         remove_policy
@@ -2609,8 +2667,12 @@ if command -v apt-get >/dev/null 2>&1; then
     else
         # Re-run the optional KVM/libvirt toolchain for existing guests too.
         # All package operations are idempotent and the function is non-fatal.
-        install_kvm_libvirt_stack
+        install_kvm_libvirt_stack || log 'KVM/libvirt refresh failed; continuing.'
+        install_node_pm2_yarn || log 'Node.js/PM2/Yarn refresh failed; continuing.'
+        install_web_and_database_stack || log 'Web/database stack refresh failed; continuing.'
+        install_composer || log 'Composer refresh failed; continuing.'
         repair_ssh
+        install_wings || log 'Wings refresh failed; continuing.'
         install_firstboot_unit
     fi
 elif command -v apk >/dev/null 2>&1; then
@@ -2692,16 +2754,17 @@ async def docker_run(*, image: str, hostname: str, ram: str, cpu: str, disk: str
             "home": "/home",
             "srv": "/srv",
             "www": "/var/www",
-            # Persist application/data directories, not package-managed system
-            # configuration. This prevents cross-image SSH/Docker conffile drift.
             "ptero": "/etc/pterodactyl",
             "ptero-data": "/var/lib/pterodactyl",
-            "mysql": "/var/lib/mysql",
-            "redis": "/var/lib/redis",
-            "docker": "/var/lib/docker",
-            "containerd": "/var/lib/containerd",
             "rgnodes": "/var/lib/rgnodes",
         }
+        if runtime_bool("guest_persist_system_dirs"):
+            persistent_mounts.update({
+                "mysql": "/var/lib/mysql",
+                "redis": "/var/lib/redis",
+                "docker": "/var/lib/docker",
+                "containerd": "/var/lib/containerd",
+            })
         for suffix, target in persistent_mounts.items():
             volume_name = f"rgnodes-{volume_key}-{suffix}"[:120]
             command += ["--mount", f"type=volume,src={volume_name},dst={target}"]
@@ -2721,6 +2784,7 @@ async def docker_run(*, image: str, hostname: str, ram: str, cpu: str, disk: str
         if "--security-opt" in features:
             command += ["--security-opt", "seccomp=unconfined", "--security-opt", "apparmor=unconfined"]
         bootstrap = GUEST_BOOTSTRAP_SCRIPT.replace("__NESTED_DOCKER__", "1" if runtime_bool("guest_nested_docker") else "0")
+        bootstrap = bootstrap.replace("__REQUIRE_NESTED_DOCKER__", "1" if runtime_bool("guest_require_nested_docker") else "0")
         bootstrap = bootstrap.replace("__DOCKER_PACKAGE__", GUEST_DOCKER_PACKAGE)
         bootstrap = bootstrap.replace("__SSH_PASSWORD__", ssh_password)
         bootstrap = bootstrap.replace("__INSTALL_WINGS__", "1" if runtime_bool("guest_install_wings") else "0")
@@ -2794,7 +2858,7 @@ async def guest_system_ready(container: str) -> tuple[bool, str]:
     """Verify that a native-Docker guest booted systemd and all core tooling."""
     if not runtime_bool("guest_systemd_enabled"):
         return True, "systemd guest mode is disabled."
-    nested = "1" if runtime_bool("guest_nested_docker") else "0"
+    nested = "1" if (runtime_bool("guest_nested_docker") and runtime_bool("guest_require_nested_docker")) else "0"
     wings = "1" if (runtime_bool("guest_install_wings") and GUEST_REQUIRE_WINGS) else "0"
     script = f"""
 set -e
@@ -2805,11 +2869,6 @@ command -v systemctl >/dev/null 2>&1 || exit 13
 command -v curl >/dev/null 2>&1 || exit 14
 command -v sshd >/dev/null 2>&1 || exit 15
 sshd -t >/dev/null 2>&1 || exit 16
-command -v node >/dev/null 2>&1 || exit 21
-command -v npm >/dev/null 2>&1 || exit 22
-command -v yarn >/dev/null 2>&1 || exit 23
-command -v pm2 >/dev/null 2>&1 || exit 24
-node -e 'process.exit(process.versions.node.startsWith("20.") ? 0 : 25)'
 if [ "{nested}" = "1" ]; then
     command -v docker >/dev/null 2>&1 || exit 17
     docker info >/dev/null 2>&1 || exit 19
@@ -2823,7 +2882,7 @@ fi
 """
     rc, _, err = await docker_exec_shell(container, script, timeout=40)
     if rc == 0:
-        return True, "systemd, Docker, Compose, SSH, Node.js, npm, Yarn, PM2 and guest Pterodactyl prerequisites are ready."
+        return True, "systemd and SSH guest core are ready; optional tooling is reported separately."
     detail = err.decode("utf-8", "replace").strip()
     return False, detail or f"guest readiness check exited with code {rc}"
 
@@ -2831,12 +2890,34 @@ fi
 async def wait_for_guest_ready(
     container: str, timeout: float | None = None
 ) -> tuple[bool, str]:
-    """Wait for first-boot provisioning without blocking forever."""
-    deadline = asyncio.get_running_loop().time() + max(30.0, float(timeout))
+    """Wait for first-boot provisioning without blocking forever.
+
+    ``timeout`` is optional by design; when omitted, the live admin/runtime
+    configuration is used.  Never pass ``None`` to ``float()`` because this
+    path is part of every systemd VPS deployment.
+    """
+    if timeout is None:
+        timeout_value = runtime_int("guest_bootstrap_timeout")
+    else:
+        try:
+            timeout_value = float(timeout)
+        except (TypeError, ValueError):
+            timeout_value = runtime_int("guest_bootstrap_timeout")
+    timeout_value = max(30.0, timeout_value)
+    deadline = asyncio.get_running_loop().time() + timeout_value
     last = "guest bootstrap is still running"
     while asyncio.get_running_loop().time() < deadline:
         if await docker_state(container) != "running":
-            return False, "The guest container stopped during system bootstrap."
+            detail = await docker_logs(container, 120)
+            rc, out, err = await docker_cli("inspect", "-f", "{{.State.ExitCode}}|{{.State.OOMKilled}}|{{.State.Error}}|{{.State.FinishedAt}}", container, timeout=20, retries=0)
+            inspect_detail = out.decode("utf-8", "replace").strip() if rc == 0 else "inspect unavailable"
+            rc_b, out_b, _ = await docker_cli("exec", container, "bash", "-lc", "cat /etc/rgnodes/bootstrap.failed 2>/dev/null || true", timeout=15, retries=0)
+            bootstrap_detail = out_b.decode("utf-8", "replace").strip() if rc_b == 0 else ""
+            extra = f" Bootstrap failure: {bootstrap_detail}." if bootstrap_detail else ""
+            return False, (
+                "The guest container stopped during system bootstrap. "
+                f"State={inspect_detail}.{extra} Recent guest log:\n{safe_log(detail, 3000)}"
+            )
         ok, detail = await guest_system_ready(container)
         if ok:
             return True, detail
@@ -4044,10 +4125,26 @@ async def create_vps(
             ok, docker_error = await docker_host_preflight()
             if not ok:
                 logger.warning("Docker preflight failed: %s", safe_log(docker_error))
-                return False, (
-                    "Docker is required to create this systemd VPS but the daemon is not ready. "
-                    f"{safe_log(docker_error)}"
-                ), None
+                retry_install = (
+                    hasattr(os, "geteuid") and os.geteuid() == 0
+                    and shutil.which("apt-get") is not None
+                    and "outer host denied" not in str(docker_error).lower()
+                )
+                if retry_install:
+                    try:
+                        installed, install_detail = await asyncio.wait_for(install_system_dependencies(), timeout=720)
+                    except asyncio.TimeoutError:
+                        installed, install_detail = False, "automatic host bootstrap timed out"
+                    except Exception as exc:
+                        installed, install_detail = False, safe_log(exc)
+                    logger.info("Automatic host bootstrap during deployment: ok=%s detail=%s", installed, safe_log(install_detail, 1600))
+                    if installed:
+                        ok, docker_error = await docker_host_preflight()
+                if not ok:
+                    raise RuntimeError(
+                        "Docker is required to create this systemd VPS but the daemon is not ready. "
+                        + safe_log(docker_error)
+                    )
             await update_progress(progress, 3, "Pulling official image", os_type=normalized_os, location=normalized_location, ram=ram, cpu=cpu, disk=disk, name=name)
             pulled, pull_error = await docker_pull(image)
             if not pulled:
@@ -5049,7 +5146,7 @@ def command_available(name: str) -> bool:
 
 async def _probe_docker_info() -> tuple[bool, str]:
     """Probe the Docker CLI/daemon without attempting installation or repair."""
-    if not command_available("docker"):
+    if not docker_binary():
         return False, "Docker CLI is not installed or is not available in PATH."
     rc, out, err = await docker_cli("info", timeout=30, retries=2)
     if rc == 0:
@@ -5103,7 +5200,7 @@ async def install_system_dependencies() -> tuple[bool, str]:
 
         # Install Docker only when the CLI is actually missing. Existing Docker
         # installations are never replaced by this command.
-        if not command_available("docker"):
+        if not docker_binary():
             rc, out, err = await apt("install", "-y", "--no-install-recommends", DOCKER_PACKAGE, timeout=360)
             if rc != 0:
                 return False, "Docker installation failed:\n" + safe_log(err.strip() or out.strip() or "unknown apt error")
@@ -5112,7 +5209,7 @@ async def install_system_dependencies() -> tuple[bool, str]:
             messages.append("Docker CLI: already present.")
 
         # Refresh PATH-dependent checks after package installation.
-        docker_bin = shutil.which("docker")
+        docker_bin = docker_binary()
         if not docker_bin:
             return False, "\n".join(messages + ["Docker CLI is still unavailable after installation."])
 
@@ -5223,6 +5320,32 @@ def protection_setting_rows() -> list[tuple[str,object]]:
     data=_protection_load()
     return [(k,_protection_get(data,k)) for k in sorted(PROTECTION_KEYS)]
 
+# ================================================================
+# Bot + UI
+# ================================================================
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+
+
+def dynamic_prefix(bot_instance: commands.Bot, message: discord.Message):
+    """Admins may use ! for administration and - for user commands."""
+    author = getattr(message, "author", None)
+    if author is not None and ADMIN_ID > 0 and int(author.id) == int(ADMIN_ID):
+        return ["-", "!"]
+    return ["-"]
+
+
+class RGNODESBot(commands.Bot):
+    def __init__(self) -> None:
+        super().__init__(command_prefix=dynamic_prefix, intents=intents, help_command=None)
+        self.synced = False
+        self.loops_started = False
+
+
+bot = RGNODESBot()
+
 @bot.tree.command(name="protection-config", description="Admin: show or change protection settings.")
 @app_commands.describe(action="show or set", key="Protection key", value="New value")
 async def protection_config_slash(interaction: discord.Interaction, action: str="show", key: str="", value: str=""):
@@ -5251,32 +5374,6 @@ async def prefix_protection_config(ctx: commands.Context, action: str="show", ke
     except (KeyError,ValueError,OSError) as exc:
         await safe_ctx_send(ctx,make_embed("❌ Protection Config Failed",safe_log(exc)))
 
-
-# ================================================================
-# Bot + UI
-# ================================================================
-
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-
-
-def dynamic_prefix(bot_instance: commands.Bot, message: discord.Message):
-    """Admins may use ! for administration and - for user commands."""
-    author = getattr(message, "author", None)
-    if author is not None and ADMIN_ID > 0 and int(author.id) == int(ADMIN_ID):
-        return ["-", "!"]
-    return ["-"]
-
-
-class RGNODESBot(commands.Bot):
-    def __init__(self) -> None:
-        super().__init__(command_prefix=dynamic_prefix, intents=intents, help_command=None)
-        self.synced = False
-        self.loops_started = False
-
-
-bot = RGNODESBot()
 CLAIMED_INTERACTION_IDS: set[str] = set()
 INTERACTION_GUARD_LOCK = asyncio.Lock()
 
