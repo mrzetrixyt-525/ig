@@ -1,0 +1,70 @@
+{
+  "host": "0.0.0.0",
+  "port": 5665,
+  "monitor_interval": 2,
+  "dashboard": {
+    "token": "",
+    "auth_header": "X-RGNodes-Token"
+  },
+  "safe_ips": [],
+  "safe_networks": [
+    "127.0.0.0/8",
+    "::1/128",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+    "fc00::/7",
+    "fe80::/10"
+  ],
+  "thresholds": {
+    "cpu_percent": 95,
+    "memory_percent": 95,
+    "disk_percent": 95,
+    "connections_per_ip": 120,
+    "connection_events_per_minute": 240,
+    "syn_like_states_per_ip": 80,
+    "global_connection_events_per_minute": 3000,
+    "block_score": 6,
+    "repeat_offense_window": 300,
+    "repeat_offense_count": 2
+  },
+  "protection": {
+    "auto_block": true,
+    "block_seconds": 1800,
+    "max_blocks": 500,
+    "firewall_backend": "auto",
+    "auto_stop_confirmed_miners": false,
+    "enable_linux_hardening": false,
+    "max_alerts_per_minute": 120
+  },
+  "miner_detection": {
+    "enabled": true,
+    "confirm_cpu_percent": 70,
+    "miner_keywords": [
+      "xmrig",
+      "minerd",
+      "cpuminer",
+      "cgminer",
+      "bfgminer",
+      "nanominer",
+      "t-rex",
+      "lolminer",
+      "nbminer",
+      "teamredminer",
+      "phoenixminer",
+      "ethminer",
+      "rigel",
+      "wildrig",
+      "hellminer",
+      "gminer"
+    ],
+    "network_keywords": [
+      "stratum+tcp",
+      "stratum+ssl",
+      "mining.pool",
+      "pool.minergate"
+    ]
+  },
+  "schema_version": 2
+}

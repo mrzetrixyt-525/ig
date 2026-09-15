@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RG Nodes VPS Protect</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="wrap">
+<header><div><h1>RG Nodes VPS Protect</h1><p>Real-time host defense & monitoring</p></div><div id="status" class="pill">Loading…</div></header>
+<section class="grid">
+  <div class="card metric"><span>CPU</span><strong id="cpu">--</strong><div class="bar"><i id="cpuBar"></i></div></div>
+  <div class="card metric"><span>Memory</span><strong id="mem">--</strong><div class="bar"><i id="memBar"></i></div></div>
+  <div class="card metric"><span>Disk</span><strong id="disk">--</strong><div class="bar"><i id="diskBar"></i></div></div>
+  <div class="card metric"><span>Connections</span><strong id="connections">--</strong><small id="unique">-- unique IPs</small></div>
+</section>
+<section class="grid two">
+  <div class="card"><h2>Network defense</h2><div id="firewall" class="note">Firewall: checking…</div><div id="net"></div></div>
+  <div class="card"><h2>Possible mining</h2><div id="miners"></div></div>
+</section>
+<section class="card"><h2>Active blocks</h2><div id="blocks"></div></section>
+<section class="card"><h2>Live alerts</h2><div id="alerts"></div></section>
+<footer>Dashboard: <code>http://SERVER-IP:5665</code> · API: <code>/api/status</code></footer>
+</div>
+<script>
+const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+function meter(id,bar,v){ document.getElementById(id).textContent=v+'%'; document.getElementById(bar).style.width=Math.min(100,Math.max(0,v))+'%'; }
+async function refresh(){
+ try{
+  const r=await fetch('/api/status',{cache:'no-store'}), d=await r.json(), m=d.metrics||{}, c=d.connections||{}, fw=d.firewall||{}, blocked=d.blocked_ips||{};
+  document.getElementById('status').textContent=d.status==='protected'?'● PROTECTED':'● UNDER PRESSURE';
+  document.getElementById('status').className='pill '+(d.status==='protected'?'ok':'warn');
+  meter('cpu','cpuBar',m.cpu??0); meter('mem','memBar',m.memory??0); meter('disk','diskBar',m.disk??0);
+  document.getElementById('connections').textContent=c.total??0; document.getElementById('unique').textContent=(c.unique_ips??0)+' unique IPs'; document.getElementById('firewall').textContent='Firewall: '+(fw.backend||'unknown')+' · '+(fw.ready?'ready':'not ready');
+  const tops=(c.top_ips||[]).map(x=>`<div class="row"><b>${esc(x[0])}</b><span>${esc(x[1])} conns</span></div>`).join('')||'<div class="muted">No remote connections</div>';
+  document.getElementById('net').innerHTML=''+tops+((c.events_per_minute??0)?`<div class="note">${esc(c.events_per_minute)} connection events/min</div>`:'');
+  const miners=d.processes||[];
+  document.getElementById('miners').innerHTML=miners.length?miners.map(p=>`<div class="row danger"><div><b>${esc(p.name)}</b><small>PID ${esc(p.pid)} · ${esc(p.match)}</small></div><span>${esc(p.cpu)}% CPU</span></div>`).join(''):'<div class="safe">No suspicious mining-like process detected</div>';
+  const blockRows=Object.entries(blocked).map(([ip,sec])=>`<div class="row danger"><b>${esc(ip)}</b><span>${esc(sec)}s remaining</span></div>`).join(''); document.getElementById('blocks').innerHTML=blockRows||'<div class="safe">No active automatic blocks</div>';
+  const alerts=d.alerts||[];
+  document.getElementById('alerts').innerHTML=alerts.length?alerts.map(a=>`<div class="alert ${esc(a.level)}"><div><b>${esc(a.title)}</b><small>${new Date(a.time).toLocaleString()} · ${esc(a.source)}</small></div><span>${esc(a.detail)}</span></div>`).join(''):'<div class="muted">No alerts</div>';
+ }catch(e){document.getElementById('status').textContent='● AGENT OFFLINE';}
+}
+refresh(); setInterval(refresh,2000);
+</script>
+</body></html>
