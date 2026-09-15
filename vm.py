@@ -187,7 +187,7 @@ _requested_web_port = env_int("PORT", 247, 1, 65535) if USE_PLATFORM_PORT else e
 WEB_PORT = 247 if _requested_web_port in WEB_RESERVED_PORTS else _requested_web_port
 WEB_PATH = os.getenv("WEB_PATH", "/").strip() or "/"
 TOTAL_CREATE_LIMIT_DEFAULT = env_int("TOTAL_CREATE_LIMIT", 1000, 1, 1000)
-DEPLOY_COST = env_int("DEPLOY_COST", 500, 0, 1000000)
+DEPLOY_COST = env_int("DEPLOY_COST", 1000, 0, 1000000)
 SLOT_PURCHASE_COST = env_int("SLOT_PURCHASE_COST", 1000, 1, 1000000)
 MAX_USER_SLOTS = env_int("MAX_USER_SLOTS", 25, 1, 1000)
 DEPLOY_COOLDOWN_SECONDS = env_int("DEPLOY_COOLDOWN_SECONDS", 15, 0, 3600)
@@ -2004,7 +2004,7 @@ async def docker_info() -> tuple[bool, str]:
         )
 
     # Automatic bootstrap is deliberately restricted to root + apt hosts.
-    if AUTO_INSTALL_DOCKER and hasattr(os, "geteuid") and os.geteuid() == 0 and shutil.which("apt-get"):
+    if AUTO_INSTALL_DOCKER and hasattr(os, "geteuid") and os.geteuid() == 0 and shutil.which("apt"):
         try:
             installed, detail = await asyncio.wait_for(install_system_dependencies(), timeout=720)
         except asyncio.TimeoutError:
@@ -2134,13 +2134,36 @@ log() { printf '[RGNODES guest] %s\\n' "$*"; }
 prepare_os_repositories() {
     if [ -f /etc/debian_version ] && [ -f /etc/os-release ]; then
         . /etc/os-release
-        if [ "${VERSION_CODENAME:-}" = "bullseye" ]; then
-            find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) -print -delete 2>/dev/null || true
-            sed -i -E 's#https?://(deb\.|security\.|ftp\.)?debian.org/debian#http://archive.debian.org/debian#g; s#https?://security.debian.org/debian-security#http://archive.debian.org/debian-security#g' /etc/apt/sources.list 2>/dev/null || true
-            printf '%s\n' 'Acquire::Check-Valid-Until "false";' >/etc/apt/apt.conf.d/99rgnodes-bullseye
-            printf '%s\n' 'Acquire::Retries "3";' >/etc/apt/apt.conf.d/80rgnodes-retries
-            printf '%s\n' 'APT::Get::Assume-Yes "true";' >/etc/apt/apt.conf.d/80rgnodes-noninteractive
-        fi
+        case "${VERSION_CODENAME:-}" in
+            bullseye)
+                # Debian 11 is EOL. The archived security suite no longer
+                # publishes a Release file, so keeping debian-security in the
+                # guest makes a normal `apt update` exit 100 and kills the
+                # entire first-boot transaction. Build a known-good archive
+                # sources.list instead and deliberately omit the obsolete
+                # security suite. The guest is isolated and this avoids a
+                # misleading bootstrap failure.
+                find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) -print -delete 2>/dev/null || true
+                cat >/etc/apt/sources.list <<'EOF_BULLSEYE'
+deb [check-valid-until=no] http://archive.debian.org/debian bullseye main
+deb [check-valid-until=no] http://archive.debian.org/debian bullseye-updates main
+EOF_BULLSEYE
+                printf '%s\n' 'Acquire::Check-Valid-Until "false";' >/etc/apt/apt.conf.d/99rgnodes-bullseye
+                printf '%s\n' 'Acquire::Retries "3";' >/etc/apt/apt.conf.d/80rgnodes-retries
+                printf '%s\n' 'APT::Get::Assume-Yes "true";' >/etc/apt/apt.conf.d/80rgnodes-noninteractive
+                ;;
+            buster)
+                # Keep the same EOL/archive safety for Debian 10 images.
+                find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) -print -delete 2>/dev/null || true
+                cat >/etc/apt/sources.list <<'EOF_BUSTER'
+deb [check-valid-until=no] http://archive.debian.org/debian buster main
+deb [check-valid-until=no] http://archive.debian.org/debian buster-updates main
+EOF_BUSTER
+                printf '%s\n' 'Acquire::Check-Valid-Until "false";' >/etc/apt/apt.conf.d/99rgnodes-buster
+                printf '%s\n' 'Acquire::Retries "3";' >/etc/apt/apt.conf.d/80rgnodes-retries
+                printf '%s\n' 'APT::Get::Assume-Yes "true";' >/etc/apt/apt.conf.d/80rgnodes-noninteractive
+                ;;
+        esac
     fi
 }
 
@@ -2168,25 +2191,126 @@ EOF
 }
 remove_policy() { rm -f /usr/sbin/policy-rc.d; }
 
+apt_update_safe() {
+    export DEBIAN_FRONTEND=noninteractive
+    if apt update -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold; then
+        return 0
+    fi
+
+    # Last-resort recovery for archived Debian images whose inherited source
+    # files still contain the retired debian-security suite. Only apply this
+    # fallback to known EOL Debian codenames; modern Ubuntu/Debian repositories
+    # must not be rewritten behind the admin's back.
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        case "${VERSION_CODENAME:-}" in
+            bullseye|buster)
+                log "APT update failed on archived Debian ${VERSION_CODENAME}; rebuilding archive sources and retrying."
+                prepare_os_repositories
+                apt clean || true
+                rm -rf /var/lib/apt/lists/*
+                apt update -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
+                return $?
+                ;;
+        esac
+    fi
+    return 1
+}
+
 apt_install_base() {
     export DEBIAN_FRONTEND=noninteractive
     export DEBCONF_NONINTERACTIVE_SEEN=true
-    dpkg --configure -a --force-confdef --force-confold -D777 >/var/log/rgnodes-dpkg-preflight.log 2>&1 || true
-    dpkg --configure -a --force-confdef --force-confold -D777 >/var/log/rgnodes-dpkg-repair.log 2>&1 || true
-    apt-get update -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
-    apt-get install -y --no-install-recommends \
+
+    # Recover an interrupted dpkg transaction without allowing stale package
+    # configuration to poison every later install attempt.
+    dpkg --audit >/var/log/rgnodes-dpkg-audit.log 2>&1 || true
+    dpkg --configure -a --force-confdef --force-confold >/var/log/rgnodes-dpkg-configure.log 2>&1 || true
+    apt -f install -y \
         -o Dpkg::Options::=--force-confdef \
-        -o Dpkg::Options::=--force-confold \
-        systemd systemd-sysv dbus dbus-user-session init-system-helpers \
-        ca-certificates curl wget gnupg lsb-release software-properties-common \
-        bash coreutils procps psmisc iproute2 iputils-ping iptables nftables \
-        util-linux net-tools netcat-openbsd socat sudo jq git \
-        tar gzip bzip2 unzip xz-utils zip rsync acl openssl \
-        make gcc g++ python3 python3-pip python3-venv \
-        openssh-client openssh-server systemd-container dbus-x11 \
-        systemd-timesyncd systemd-resolved locales logrotate ufw \
-        -o Dpkg::Options::=--force-confdef \
-        -o Dpkg::Options::=--force-confold
+        -o Dpkg::Options::=--force-confold >/var/log/rgnodes-apt-fix.log 2>&1 || true
+
+    if ! apt_update_safe; then
+        log 'APT package indexes could not be refreshed; refusing bootstrap rather than installing from stale metadata.'
+        return 70
+    fi
+
+    # HARD REQUIREMENTS ONLY.
+    # A guest is considered healthy when systemd + SSH can start. Optional
+    # utilities are deliberately isolated below so one missing/conflicting
+    # package (for example ufw, systemd-resolved, or software-properties-common)
+    # cannot make VPS creation fail after the image itself booted correctly.
+    local core_packages=(
+        systemd
+        systemd-sysv
+        dbus
+        dbus-user-session
+        init-system-helpers
+        ca-certificates
+        curl
+        wget
+        bash
+        coreutils
+        procps
+        psmisc
+        iproute2
+        iputils-ping
+        util-linux
+        openssl
+        openssh-client
+        openssh-server
+    )
+
+    local pkg
+    for pkg in "${core_packages[@]}"; do
+        if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed'; then
+            continue
+        fi
+        if ! apt install -y --no-install-recommends \
+            -o Dpkg::Options::=--force-confdef \
+            -o Dpkg::Options::=--force-confold \
+            "$pkg"; then
+            log "CORE package installation failed: $pkg"
+            dpkg --configure -a --force-confdef --force-confold >/dev/null 2>&1 || true
+            apt -f install -y \
+                -o Dpkg::Options::=--force-confdef \
+                -o Dpkg::Options::=--force-confold >/dev/null 2>&1 || true
+            if ! apt install -y --no-install-recommends \
+                -o Dpkg::Options::=--force-confdef \
+                -o Dpkg::Options::=--force-confold \
+                "$pkg"; then
+                log "CORE package still unavailable after recovery: $pkg"
+                return 71
+            fi
+        fi
+    done
+
+    # SOFT REQUIREMENTS. Install one package at a time so a single unavailable
+    # package never aborts the whole VPS. These tools are useful but not part of
+    # the systemd/SSH readiness contract.
+    local optional_packages=(
+        gnupg lsb-release software-properties-common
+        iptables nftables net-tools netcat-openbsd socat sudo jq git
+        tar gzip bzip2 unzip xz-utils zip rsync acl make gcc g++
+        python3 python3-pip python3-venv systemd-container dbus-x11
+        systemd-timesyncd systemd-resolved locales logrotate ufw
+    )
+    for pkg in "${optional_packages[@]}"; do
+        if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed'; then
+            continue
+        fi
+        apt install -y --no-install-recommends \
+            -o Dpkg::Options::=--force-confdef \
+            -o Dpkg::Options::=--force-confold \
+            "$pkg" >/var/log/rgnodes-apt-optional.log 2>&1 || \
+            log "Optional package unavailable/skipped: $pkg"
+    done
+
+    # Ensure the two actual readiness primitives exist before leaving the
+    # bootstrap function. This avoids a false-success where apt exited cleanly
+    # but sshd/systemd were not installed due to a package-manager edge case.
+    command -v systemctl >/dev/null 2>&1 || { log 'systemctl is missing after core package installation'; return 72; }
+    command -v sshd >/dev/null 2>&1 || { log 'sshd is missing after core package installation'; return 73; }
+    return 0
 }
 
 install_kvm_libvirt_stack() {
@@ -2200,8 +2324,8 @@ install_kvm_libvirt_stack() {
     id="$(. /etc/os-release && printf '%s' "${ID:-}")"
     case "$id" in
         ubuntu|debian|linuxmint|pop|raspbian)
-            pkgs=(qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils virtinst virt-manager)
-            if apt-get install -y --no-install-recommends \
+            pkgs=(qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils virtinst)
+            if apt install -y --no-install-recommends \
                 -o Dpkg::Options::=--force-confdef \
                 -o Dpkg::Options::=--force-confold \
                 "${pkgs[@]}"; then
@@ -2210,7 +2334,7 @@ install_kvm_libvirt_stack() {
                 log 'KVM/libvirt package install was not fully available; continuing without failing VPS creation.'
                 # Retry the core headless stack without virt-manager, which is GUI-oriented
                 # and can be unavailable on some minimal repositories.
-                if apt-get install -y --no-install-recommends \
+                if apt install -y --no-install-recommends \
                     -o Dpkg::Options::=--force-confdef \
                     -o Dpkg::Options::=--force-confold \
                     qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils virtinst; then
@@ -2293,26 +2417,26 @@ install_web_and_database_stack() {
         fi
     fi
 
-    apt-get update -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
-    apt-get install -y --no-install-recommends \
+    apt update -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
+    apt install -y --no-install-recommends \
         -o Dpkg::Options::=--force-confdef \
         -o Dpkg::Options::=--force-confold \
         nginx certbot python3-certbot-nginx tar unzip git \
         mariadb-server mariadb-client redis-server
 
-    if ! apt-get install -y --no-install-recommends \
+    if ! apt install -y --no-install-recommends \
         -o Dpkg::Options::=--force-confdef \
         -o Dpkg::Options::=--force-confold \
         php8.3 php8.3-common php8.3-cli php8.3-gd php8.3-mysql \
         php8.3-mbstring php8.3-bcmath php8.3-xml php8.3-tokenizer \
         php8.3-fpm php8.3-curl php8.3-zip; then
-        if ! apt-get install -y --no-install-recommends \
+        if ! apt install -y --no-install-recommends \
         -o Dpkg::Options::=--force-confdef \
         -o Dpkg::Options::=--force-confold \
             php8.2 php8.2-common php8.2-cli php8.2-gd php8.2-mysql \
             php8.2-mbstring php8.2-bcmath php8.2-xml php8.2-tokenizer \
             php8.2-fpm php8.2-curl php8.2-zip; then
-            apt-get install -y --no-install-recommends \
+            apt install -y --no-install-recommends \
         -o Dpkg::Options::=--force-confdef \
         -o Dpkg::Options::=--force-confold \
                 php php-common php-cli php-gd php-mysql php-mbstring \
@@ -2334,7 +2458,7 @@ install_docker_debian_ubuntu() {
     esac
 
     # Remove only conflicting package names. Never remove Docker data.
-    apt-get remove -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+    apt remove -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
         docker.io docker-compose docker-compose-v2 docker-doc docker-buildx \
         podman-docker containerd runc >/dev/null 2>&1 || true
 
@@ -2353,7 +2477,7 @@ Components: stable
 Architectures: $arch
 Signed-By: /etc/apt/keyrings/docker.asc
 EOF
-            if apt-get update -y && apt-get install -y --no-install-recommends \
+            if apt update -y && apt install -y --no-install-recommends \
         -o Dpkg::Options::=--force-confdef \
         -o Dpkg::Options::=--force-confold \
                 docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; then
@@ -2363,20 +2487,20 @@ EOF
         rm -f /etc/apt/sources.list.d/docker.sources
     fi
 
-    apt-get update -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
-    apt-get install -y --no-install-recommends \
+    apt update -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
+    apt install -y --no-install-recommends \
         -o Dpkg::Options::=--force-confdef \
         -o Dpkg::Options::=--force-confold \
         docker.io containerd runc
 
     if ! docker compose version >/dev/null 2>&1; then
-        apt-get install -y --no-install-recommends \
+        apt install -y --no-install-recommends \
             -o Dpkg::Options::=--force-confdef \
             -o Dpkg::Options::=--force-confold \
             docker-compose-v2 docker-compose-plugin || true
     fi
     if ! docker compose version >/dev/null 2>&1; then
-        apt-get install -y --no-install-recommends \
+        apt install -y --no-install-recommends \
             -o Dpkg::Options::=--force-confdef \
             -o Dpkg::Options::=--force-confold \
             docker-compose-plugin || true
@@ -2423,10 +2547,10 @@ Components: main
 Architectures: $arch
 Signed-By: /etc/apt/keyrings/nodesource.gpg
 EOF
-        apt-get update -y || true
+        apt update -y || true
     fi
 
-    if ! apt-get install -y --no-install-recommends \
+    if ! apt install -y --no-install-recommends \
         -o Dpkg::Options::=--force-confdef \
         -o Dpkg::Options::=--force-confold \
         nodejs; then
@@ -2637,7 +2761,7 @@ EOF
         /etc/systemd/system/multi-user.target.wants/rgnodes-firstboot.service
 }
 
-if command -v apt-get >/dev/null 2>&1; then
+if command -v apt >/dev/null 2>&1; then
     install_dpkg_policy
     prepare_os_repositories
     if [ ! -f "$BOOTSTRAP_MARKER" ]; then
@@ -3150,9 +3274,9 @@ if pid_alive "$FOUND_PID"; then
     exit 0
 fi
 
-if ! command -v curl >/dev/null 2>&1 && [ "$(id -u 2>/dev/null)" = "0" ] && command -v apt-get >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
-    DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates >/dev/null 2>&1 || true
+if ! command -v curl >/dev/null 2>&1 && [ "$(id -u 2>/dev/null)" = "0" ] && command -v apt >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt update -y >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt install -y curl ca-certificates >/dev/null 2>&1 || true
 fi
 command -v curl >/dev/null 2>&1 || { printf '%s\n' '[SSHX] ERROR: curl unavailable'; exit 20; }
 
@@ -4127,7 +4251,7 @@ async def create_vps(
                 logger.warning("Docker preflight failed: %s", safe_log(docker_error))
                 retry_install = (
                     hasattr(os, "geteuid") and os.geteuid() == 0
-                    and shutil.which("apt-get") is not None
+                    and shutil.which("apt") is not None
                     and "outer host denied" not in str(docker_error).lower()
                 )
                 if retry_install:
@@ -5165,11 +5289,11 @@ async def install_system_dependencies() -> tuple[bool, str]:
         if info["root"] != "true":
             return False, "Administrator/root privileges are required. Run the bot as root or grant it the required host permissions."
 
-        package_manager = shutil.which("apt-get")
+        package_manager = shutil.which("apt")
         if not package_manager:
             if shutil.which("apk"):
                 return False, "This host uses Alpine/apk. Automatic bootstrap is intentionally limited to Debian/Ubuntu apt hosts."
-            return False, "No supported package manager was found. Supported automatic bootstrap: Debian/Ubuntu with apt-get."
+            return False, "No supported package manager was found. Supported automatic bootstrap: Debian/Ubuntu with apt."
 
         os_id = info["id"].lower()
         if os_id not in {"debian", "ubuntu", "linuxmint", "pop", "raspbian"}:
@@ -5181,7 +5305,7 @@ async def install_system_dependencies() -> tuple[bool, str]:
 
         async def apt(*args: str, timeout: float = 300) -> tuple[int, str, str]:
             return await system_command(
-                "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", *args,
+                "env", "DEBIAN_FRONTEND=noninteractive", "apt", *args,
                 timeout=timeout,
             )
 
@@ -5189,7 +5313,7 @@ async def install_system_dependencies() -> tuple[bool, str]:
         # important in Docker/containers/WSL-like environments.
         rc, _, err = await apt("update", "-y", timeout=300)
         if rc != 0:
-            return False, "apt-get update failed:\n" + safe_log(err.strip() or "unknown apt error")
+            return False, "apt update failed:\n" + safe_log(err.strip() or "unknown apt error")
 
         # command/package names differ (ca-certificates has no binary check).
         # Install the full small base set; apt safely skips packages already installed.
